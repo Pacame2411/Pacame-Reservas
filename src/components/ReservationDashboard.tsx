@@ -16,13 +16,17 @@ export const ReservationDashboard: React.FC = () => {
     loadReservations();
   }, [selectedDate]);
 
-  const loadReservations = () => {
+  const loadReservations = async () => {
     setLoading(true);
-    setTimeout(() => {
-      const dateReservations = reservationService.getReservationsByDate(selectedDate);
+    try {
+      const dateReservations = await reservationService.getReservationsByDateDefault(selectedDate);
       setReservations(dateReservations.sort((a, b) => a.time.localeCompare(b.time)));
       setLoading(false);
-    }, 300);
+    } catch (error) {
+      console.error('Error loading reservations:', error);
+      setReservations([]);
+      setLoading(false);
+    }
   };
 
   // Filtrar reservas
