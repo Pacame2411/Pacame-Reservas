@@ -32,11 +32,21 @@ export interface TimeSlot {
 
 export interface Table {
   id: string;
-  number: string;
+  restaurant_id: string;
+  table_number: string;
   capacity: number;
   type: string;
-  features?: string;
-  location: string;
+  zone: string;
+  features?: string[];
+  position?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+  is_active: boolean;
+  created_at: string;
+  updated_at?: string;
 }
 
 export interface RestaurantConfig {
@@ -60,16 +70,20 @@ export interface RestaurantConfig {
 
 export interface TableLayoutTable {
   id: string;
-  number: string;
+  restaurant_id: string;
+  table_number: string;
   x: number;
   y: number;
   width: number;
   height: number;
   shape: 'square' | 'circle' | 'rectangle';
   capacity: number;
-  zone: string;
+  zone_id: string;
   type: string;
-  features: string[];
+  features?: string[];
+  is_active: boolean;
+  created_at: string;
+  updated_at?: string;
 }
 
 export interface TableLayout {
@@ -81,6 +95,15 @@ export interface TableLayout {
     name: string;
     color: string;
   }>;
+}
+
+export interface Zone {
+  id: string;
+  restaurant_id: string;
+  name: string;
+  color: string;
+  created_at: string;
+  updated_at?: string;
 }
 
 export interface ReservationRules {

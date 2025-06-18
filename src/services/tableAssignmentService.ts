@@ -1,6 +1,8 @@
-import { Reservation, TableLayoutTable } from '../types';
-import { configurationService } from './configurationService';
+import { Reservation, Table, TableLayoutTable } from '../types';
+import { supabase } from '../utils/supabase';
 import { reservationService } from './reservationService';
+import { tableService } from './tableService';
+import { configurationService } from './configurationService';
 
 interface TableAssignment {
   reservationId: string;
@@ -17,76 +19,91 @@ interface AssignmentCriteria {
   groupSeparation: number;
 }
 
+interface TableWithReservation extends Table {
+  currentReservation?: Reservation;
+  nextReservation?: Reservation;
+  status: 'free' | 'reserved' | 'occupied' | 'blocked';
+}
+
 class TableAssignmentService {
-  private tableLayout = configurationService.getTableLayout();
+  // Asignación automática de mesas para múltiples reservas
+  async autoAssignTables(
+    restaurantId: string,
+    reservations: Reservation[], 
+    date: string
+  ): Promise<TableAssignment[]> {
+    try {
+      const assignments: TableAssignment[] = [];
+      const availableTables = await tableService.getAllTables(restaurantId);
+      const existingReservations = await reservationService.getReservationsByDate(restaurantId, date);
 
-  // Asignación automática de mesas
-  async autoAssignTables(reservations: Reservation[], date: string): Promise<TableAssignment[]> {
-    const assignments: TableAssignment[] = [];
-    const availableTables = [...this.tableLayout.tables];
-    const existingReservations = reservationService.getReservationsByDate(date);
+      // Ordenar reservas por prioridad (grupos grandes primero, luego por hora)
+      const sortedReservations = reservations.sort((a, b) => {
+        if (a.guests !== b.guests) {
+          return b.guests - a.guests; // Grupos grandes primero
+        }
+        return a.reservation_time.localeCompare(b.reservation_time); // Luego por hora
+      });
 
-    // Ordenar reservas por prioridad (grupos grandes primero, luego por hora)
-    const sortedReservations = reservations.sort((a, b) => {
-      if (a.guests !== b.guests) {
-        return b.guests - a.guests; // Grupos grandes primero
-      }
-      return a.time.localeCompare(b.time); // Luego por hora
-    });
+      for (const reservation of sortedReservations) {
+        const bestTable = await this.findBestTable(
+          restaurantId,
+          reservation,
+          availableTables,
+          existingReservations,
+          assignments
+        );
 
-    for (const reservation of sortedReservations) {
-      const bestTable = this.findBestTable(
-        reservation,
-        availableTables,
-        existingReservations,
-        assignments
-      );
+        if (bestTable) {
+          assignments.push({
+            reservationId: reservation.id,
+            tableId: bestTable.table.id,
+            score: bestTable.score,
+            reasons: bestTable.reasons
+          });
 
-      if (bestTable) {
-        assignments.push({
-          reservationId: reservation.id,
-          tableId: bestTable.table.id,
-          score: bestTable.score,
-          reasons: bestTable.reasons
-        });
-
-        // Remover mesa de disponibles si es necesario
-        const tableIndex = availableTables.findIndex(t => t.id === bestTable.table.id);
-        if (tableIndex !== -1) {
-          // Verificar si la mesa estará ocupada durante el tiempo de la reserva
-          const conflictingReservations = this.getConflictingReservations(
-            bestTable.table.id,
-            reservation,
-            existingReservations,
-            assignments
-          );
-
-          if (conflictingReservations.length > 0) {
-            availableTables.splice(tableIndex, 1);
-          }
+          console.log(`✅ Mesa ${bestTable.table.table_number} asignada a ${reservation.customer_name} (Score: ${bestTable.score})`);
+        } else {
+          console.warn(`⚠️ No se encontró mesa disponible para ${reservation.customer_name}`);
         }
       }
-    }
 
-    return assignments;
+      return assignments;
+    } catch (error) {
+      console.error('Error en autoAssignTables:', error);
+      return [];
+    }
   }
 
-  // Encontrar la mejor mesa para una reserva
-  private findBestTable(
+  // Encontrar la mejor mesa para una reserva específica
+  private async findBestTable(
+    restaurantId: string,
     reservation: Reservation,
-    availableTables: TableLayoutTable[],
+    availableTables: Table[],
     existingReservations: Reservation[],
     currentAssignments: TableAssignment[]
-  ): { table: TableLayoutTable; score: number; reasons: string[] } | null {
-    let bestMatch: { table: TableLayoutTable; score: number; reasons: string[] } | null = null;
+  ): Promise<{ table: Table; score: number; reasons: string[] } | null> {
+    let bestMatch: { table: Table; score: number; reasons: string[] } | null = null;
 
     for (const table of availableTables) {
       // Verificar disponibilidad básica
-      if (!this.isTableAvailable(table, reservation, existingReservations, currentAssignments)) {
+      const isAvailable = await this.isTableAvailable(
+        table, 
+        reservation, 
+        existingReservations, 
+        currentAssignments
+      );
+
+      if (!isAvailable) {
         continue;
       }
 
-      const score = this.calculateTableScore(table, reservation, existingReservations);
+      const score = await this.calculateTableScore(
+        restaurantId,
+        table, 
+        reservation, 
+        existingReservations
+      );
       
       if (!bestMatch || score.total > bestMatch.score) {
         bestMatch = {
@@ -100,20 +117,20 @@ class TableAssignmentService {
     return bestMatch;
   }
 
-  // Verificar si una mesa está disponible
-  private isTableAvailable(
-    table: TableLayoutTable,
+  // Verificar si una mesa está disponible para una reserva
+  private async isTableAvailable(
+    table: Table,
     reservation: Reservation,
     existingReservations: Reservation[],
     currentAssignments: TableAssignment[]
-  ): boolean {
+  ): Promise<boolean> {
     // Verificar capacidad mínima
     if (table.capacity < reservation.guests) {
       return false;
     }
 
     // Verificar conflictos con reservas existentes
-    const conflicts = this.getConflictingReservations(
+    const conflicts = await this.getConflictingReservations(
       table.id,
       reservation,
       existingReservations,
@@ -124,31 +141,31 @@ class TableAssignmentService {
   }
 
   // Obtener reservas que conflictan con una nueva asignación
-  private getConflictingReservations(
+  private async getConflictingReservations(
     tableId: string,
     newReservation: Reservation,
     existingReservations: Reservation[],
     currentAssignments: TableAssignment[]
-  ): Reservation[] {
-    const duration = newReservation.duration || 120; // 2 horas por defecto
-    const newStart = this.timeToMinutes(newReservation.time);
+  ): Promise<Reservation[]> {
+    const duration = newReservation.duration_minutes || 120;
+    const newStart = this.timeToMinutes(newReservation.reservation_time);
     const newEnd = newStart + duration;
 
     // Verificar reservas existentes
     const existingConflicts = existingReservations.filter(existing => {
-      if (existing.assignedTable !== tableId || existing.status === 'cancelled') {
+      if (existing.assigned_table_id !== tableId || existing.status === 'cancelled') {
         return false;
       }
 
-      const existingDuration = existing.duration || 120;
-      const existingStart = this.timeToMinutes(existing.time);
+      const existingDuration = existing.duration_minutes || 120;
+      const existingStart = this.timeToMinutes(existing.reservation_time);
       const existingEnd = existingStart + existingDuration;
 
       // Verificar solapamiento
       return newStart < existingEnd && newEnd > existingStart;
     });
 
-    // Verificar asignaciones actuales
+    // Verificar asignaciones actuales en el mismo proceso
     const currentConflicts = currentAssignments.filter(assignment => {
       if (assignment.tableId !== tableId) {
         return false;
@@ -158,8 +175,8 @@ class TableAssignmentService {
       const assignedReservation = existingReservations.find(r => r.id === assignment.reservationId);
       if (!assignedReservation) return false;
 
-      const assignedDuration = assignedReservation.duration || 120;
-      const assignedStart = this.timeToMinutes(assignedReservation.time);
+      const assignedDuration = assignedReservation.duration_minutes || 120;
+      const assignedStart = this.timeToMinutes(assignedReservation.reservation_time);
       const assignedEnd = assignedStart + assignedDuration;
 
       return newStart < assignedEnd && newEnd > assignedStart;
@@ -167,15 +184,16 @@ class TableAssignmentService {
 
     return [...existingConflicts, ...currentConflicts.map(c => 
       existingReservations.find(r => r.id === c.reservationId)!
-    )];
+    ).filter(Boolean)];
   }
 
   // Calcular puntuación de una mesa para una reserva
-  private calculateTableScore(
-    table: TableLayoutTable,
+  private async calculateTableScore(
+    restaurantId: string,
+    table: Table,
     reservation: Reservation,
     existingReservations: Reservation[]
-  ): { total: number; reasons: string[] } {
+  ): Promise<{ total: number; reasons: string[] }> {
     const criteria: AssignmentCriteria = {
       capacityMatch: 0,
       zonePreference: 0,
@@ -202,8 +220,8 @@ class TableAssignmentService {
     }
 
     // 2. Preferencia de zona (25% del peso)
-    if (reservation.tableType) {
-      const preferredZones = this.getPreferredZones(reservation.tableType);
+    if (reservation.table_type_preference) {
+      const preferredZones = this.getPreferredZones(reservation.table_type_preference);
       if (preferredZones.includes(table.zone)) {
         criteria.zonePreference = 25;
         reasons.push(`Zona preferida: ${table.zone}`);
@@ -222,14 +240,19 @@ class TableAssignmentService {
     }
 
     // 4. Optimización de tiempo (10% del peso)
-    const timeScore = this.calculateTimeOptimization(table, reservation, existingReservations);
+    const timeScore = await this.calculateTimeOptimization(table, reservation, existingReservations);
     criteria.timeOptimization = timeScore;
     if (timeScore > 5) {
       reasons.push('Optimización de horarios');
     }
 
     // 5. Separación de grupos (5% del peso)
-    const separationScore = this.calculateGroupSeparation(table, reservation, existingReservations);
+    const separationScore = await this.calculateGroupSeparation(
+      restaurantId,
+      table, 
+      reservation, 
+      existingReservations
+    );
     criteria.groupSeparation = separationScore;
 
     const total = Object.values(criteria).reduce((sum, score) => sum + score, 0);
@@ -240,10 +263,10 @@ class TableAssignmentService {
   // Obtener zonas preferidas según el tipo de mesa solicitado
   private getPreferredZones(tableType: string): string[] {
     const zoneMap: Record<string, string[]> = {
-      'window': ['interior'],
-      'terrace': ['exterior'],
-      'private': ['vip'],
-      'bar': ['bar'],
+      'window': ['interior', 'ventana'],
+      'terrace': ['exterior', 'terraza'],
+      'private': ['vip', 'privada'],
+      'bar': ['bar', 'barra'],
       'any': ['interior', 'exterior', 'vip', 'bar']
     };
 
@@ -252,17 +275,17 @@ class TableAssignmentService {
 
   // Calcular puntuación por características especiales
   private calculateFeatureScore(
-    table: TableLayoutTable,
+    table: Table,
     reservation: Reservation
   ): { score: number; reasons: string[] } {
     let score = 10; // Base score
     const reasons: string[] = [];
 
     // Verificar peticiones especiales
-    if (reservation.specialRequests) {
-      const requests = reservation.specialRequests.toLowerCase();
+    if (reservation.special_requests) {
+      const requests = reservation.special_requests.toLowerCase();
       
-      if (requests.includes('ventana') && table.features.includes('vista')) {
+      if (requests.includes('ventana') && table.features?.includes('vista')) {
         score += 10;
         reasons.push('Mesa con vista');
       }
@@ -284,7 +307,7 @@ class TableAssignmentService {
     }
 
     // Bonificación por características premium
-    if (table.features.includes('premium')) {
+    if (table.features?.includes('premium')) {
       score += 5;
       reasons.push('Mesa premium');
     }
@@ -293,13 +316,13 @@ class TableAssignmentService {
   }
 
   // Calcular optimización de tiempo
-  private calculateTimeOptimization(
-    table: TableLayoutTable,
+  private async calculateTimeOptimization(
+    table: Table,
     reservation: Reservation,
     existingReservations: Reservation[]
-  ): number {
+  ): Promise<number> {
     const tableReservations = existingReservations.filter(r => 
-      r.assignedTable === table.id && r.status !== 'cancelled'
+      r.assigned_table_id === table.id && r.status !== 'cancelled'
     );
 
     if (tableReservations.length === 0) {
@@ -307,12 +330,12 @@ class TableAssignmentService {
     }
 
     // Verificar si hay tiempo suficiente entre reservas
-    const reservationTime = this.timeToMinutes(reservation.time);
-    const duration = reservation.duration || 120;
+    const reservationTime = this.timeToMinutes(reservation.reservation_time);
+    const duration = reservation.duration_minutes || 120;
 
     for (const existing of tableReservations) {
-      const existingTime = this.timeToMinutes(existing.time);
-      const existingDuration = existing.duration || 120;
+      const existingTime = this.timeToMinutes(existing.reservation_time);
+      const existingDuration = existing.duration_minutes || 120;
       
       const timeBetween = Math.abs(reservationTime - (existingTime + existingDuration));
       
@@ -327,46 +350,246 @@ class TableAssignmentService {
   }
 
   // Calcular separación de grupos
-  private calculateGroupSeparation(
-    table: TableLayoutTable,
+  private async calculateGroupSeparation(
+    restaurantId: string,
+    table: Table,
     reservation: Reservation,
     existingReservations: Reservation[]
-  ): number {
+  ): Promise<number> {
     // Lógica simple: evitar mesas adyacentes para grupos grandes
     if (reservation.guests >= 6) {
-      const nearbyTables = this.getNearbyTables(table);
-      const busyNearbyTables = nearbyTables.filter(nearbyTable => 
-        existingReservations.some(r => 
-          r.assignedTable === nearbyTable.id && 
-          r.status !== 'cancelled' &&
-          Math.abs(this.timeToMinutes(r.time) - this.timeToMinutes(reservation.time)) < 60
-        )
-      );
+      try {
+        const nearbyTables = await this.getNearbyTables(restaurantId, table);
+        const busyNearbyTables = nearbyTables.filter(nearbyTable => 
+          existingReservations.some(r => 
+            r.assigned_table_id === nearbyTable.id && 
+            r.status !== 'cancelled' &&
+            Math.abs(
+              this.timeToMinutes(r.reservation_time) - 
+              this.timeToMinutes(reservation.reservation_time)
+            ) < 60
+          )
+        );
 
-      if (busyNearbyTables.length === 0) {
-        return 5; // Área tranquila
-      } else if (busyNearbyTables.length <= 1) {
-        return 3; // Algo de espacio
+        if (busyNearbyTables.length === 0) {
+          return 5; // Área tranquila
+        } else if (busyNearbyTables.length <= 1) {
+          return 3; // Algo de espacio
+        }
+      } catch (error) {
+        console.error('Error calculando separación de grupos:', error);
       }
     }
 
     return 2; // Puntuación base
   }
 
-  // Obtener mesas cercanas (simplificado)
-  private getNearbyTables(table: TableLayoutTable): TableLayoutTable[] {
-    const proximityThreshold = 100; // píxeles
-    
-    return this.tableLayout.tables.filter(otherTable => {
-      if (otherTable.id === table.id) return false;
+  // Obtener mesas cercanas (basado en posición si está disponible)
+  private async getNearbyTables(restaurantId: string, table: Table): Promise<Table[]> {
+    try {
+      const allTables = await tableService.getAllTables(restaurantId);
       
-      const distance = Math.sqrt(
-        Math.pow(table.x - otherTable.x, 2) + 
-        Math.pow(table.y - otherTable.y, 2)
+      // Si no hay información de posición, usar zona como proximidad
+      if (!table.position) {
+        return allTables.filter(otherTable => 
+          otherTable.id !== table.id && otherTable.zone === table.zone
+        );
+      }
+
+      // Si hay información de posición, calcular distancia
+      const proximityThreshold = 100; // píxeles
+      
+      return allTables.filter(otherTable => {
+        if (otherTable.id === table.id || !otherTable.position) return false;
+        
+        const distance = Math.sqrt(
+          Math.pow(table.position!.x - otherTable.position!.x, 2) + 
+          Math.pow(table.position!.y - otherTable.position!.y, 2)
+        );
+        
+        return distance <= proximityThreshold;
+      });
+    } catch (error) {
+      console.error('Error obteniendo mesas cercanas:', error);
+      return [];
+    }
+  }
+
+  // Sugerir mesa alternativa
+  async suggestAlternativeTable(
+    restaurantId: string,
+    reservation: Reservation,
+    preferredTableId: string,
+    date: string
+  ): Promise<{ table: Table; reasons: string[] } | null> {
+    try {
+      const availableTables = await tableService.getAllTables(restaurantId);
+      const filteredTables = availableTables.filter(t => t.id !== preferredTableId);
+      const existingReservations = await reservationService.getReservationsByDate(restaurantId, date);
+      
+      const bestAlternative = await this.findBestTable(
+        restaurantId,
+        reservation,
+        filteredTables,
+        existingReservations,
+        []
       );
+
+      return bestAlternative;
+    } catch (error) {
+      console.error('Error sugiriendo mesa alternativa:', error);
+      return null;
+    }
+  }
+
+  // Optimizar distribución completa del día
+  async optimizeFullDayDistribution(restaurantId: string, date: string): Promise<TableAssignment[]> {
+    try {
+      const allReservations = await reservationService.getReservationsByDate(restaurantId, date);
+      const unassignedReservations = allReservations
+        .filter(r => r.status !== 'cancelled')
+        .map(r => ({ ...r, assigned_table_id: undefined }));
       
-      return distance <= proximityThreshold;
-    });
+      return this.autoAssignTables(restaurantId, unassignedReservations, date);
+    } catch (error) {
+      console.error('Error optimizando distribución del día:', error);
+      return [];
+    }
+  }
+
+  // Verificar conflictos de asignación
+  async validateAssignment(
+    restaurantId: string,
+    reservation: Reservation,
+    tableId: string,
+    date: string
+  ): Promise<{ valid: boolean; conflicts: string[]; warnings: string[] }> {
+    try {
+      const table = await tableService.getTableById(restaurantId, tableId);
+      const conflicts: string[] = [];
+      const warnings: string[] = [];
+
+      if (!table) {
+        conflicts.push('Mesa no encontrada');
+        return { valid: false, conflicts, warnings };
+      }
+
+      // Verificar capacidad
+      if (table.capacity < reservation.guests) {
+        conflicts.push(`La mesa tiene capacidad para ${table.capacity} pero la reserva es para ${reservation.guests} personas`);
+      } else if (table.capacity > reservation.guests * 2) {
+        warnings.push('La mesa es considerablemente más grande que el grupo');
+      }
+
+      // Verificar disponibilidad de tiempo
+      const existingReservations = await reservationService.getReservationsByDate(restaurantId, date);
+      const timeConflicts = await this.getConflictingReservations(tableId, reservation, existingReservations, []);
+      
+      if (timeConflicts.length > 0) {
+        conflicts.push(`Conflicto de horario con reserva existente`);
+      }
+
+      return {
+        valid: conflicts.length === 0,
+        conflicts,
+        warnings
+      };
+    } catch (error) {
+      console.error('Error validando asignación:', error);
+      return {
+        valid: false,
+        conflicts: ['Error interno del servidor'],
+        warnings: []
+      };
+    }
+  }
+
+  // Aplicar asignaciones automáticas
+  async applyAssignments(assignments: TableAssignment[]): Promise<{ success: number; failed: number; errors: string[] }> {
+    let success = 0;
+    let failed = 0;
+    const errors: string[] = [];
+
+    for (const assignment of assignments) {
+      try {
+        const result = await tableService.assignTableToReservation(
+          assignment.reservationId,
+          assignment.tableId
+        );
+
+        if (result.success) {
+          success++;
+        } else {
+          failed++;
+          errors.push(`Error asignando mesa a reserva ${assignment.reservationId}: ${result.error}`);
+        }
+      } catch (error) {
+        failed++;
+        errors.push(`Error procesando asignación para reserva ${assignment.reservationId}: ${error}`);
+      }
+    }
+
+    return { success, failed, errors };
+  }
+
+  // Obtener estado de mesas para una fecha y hora específica
+  async getTablesStatus(
+    restaurantId: string, 
+    date: string, 
+    time?: string
+  ): Promise<TableWithReservation[]> {
+    try {
+      const tables = await tableService.getAllTables(restaurantId);
+      const dayReservations = await reservationService.getReservationsByDate(restaurantId, date);
+      
+      return tables.map(table => {
+        let currentReservation: Reservation | undefined;
+        let nextReservation: Reservation | undefined;
+        let status: 'free' | 'reserved' | 'occupied' | 'blocked' = 'free';
+
+        const tableReservations = dayReservations
+          .filter(r => r.assigned_table_id === table.id && r.status !== 'cancelled')
+          .sort((a, b) => a.reservation_time.localeCompare(b.reservation_time));
+
+        if (time) {
+          // Buscar reserva actual para la hora específica
+          const currentTime = this.timeToMinutes(time);
+          
+          for (const reservation of tableReservations) {
+            const resStart = this.timeToMinutes(reservation.reservation_time);
+            const resEnd = resStart + (reservation.duration_minutes || 120);
+            
+            if (currentTime >= resStart && currentTime < resEnd) {
+              currentReservation = reservation;
+              status = reservation.status === 'confirmed' ? 'occupied' : 'reserved';
+              break;
+            }
+          }
+
+          // Buscar próxima reserva
+          nextReservation = tableReservations.find(r => 
+            this.timeToMinutes(r.reservation_time) > currentTime
+          );
+        } else {
+          // Sin hora específica, mostrar primera reserva del día
+          if (tableReservations.length > 0) {
+            currentReservation = tableReservations[0];
+            status = 'reserved';
+            nextReservation = tableReservations[1];
+          }
+        }
+
+        return {
+          ...table,
+          currentReservation,
+          nextReservation,
+          status
+        };
+      });
+    } catch (error) {
+      console.error('Error obteniendo estado de mesas:', error);
+      return [];
+    }
   }
 
   // Convertir tiempo a minutos desde medianoche
@@ -375,71 +598,33 @@ class TableAssignmentService {
     return hours * 60 + minutes;
   }
 
-  // Sugerir mesa alternativa
-  async suggestAlternativeTable(
+  // Métodos de conveniencia para mantener compatibilidad
+  async autoAssignTablesDefault(reservations: Reservation[], date: string): Promise<TableAssignment[]> {
+    return this.autoAssignTables('default-restaurant-id', reservations, date);
+  }
+
+  async suggestAlternativeTableDefault(
     reservation: Reservation,
     preferredTableId: string,
     date: string
-  ): Promise<{ table: TableLayoutTable; reasons: string[] } | null> {
-    const availableTables = this.tableLayout.tables.filter(t => t.id !== preferredTableId);
-    const existingReservations = reservationService.getReservationsByDate(date);
-    
-    const bestAlternative = this.findBestTable(
-      reservation,
-      availableTables,
-      existingReservations,
-      []
-    );
-
-    return bestAlternative;
+  ): Promise<{ table: Table; reasons: string[] } | null> {
+    return this.suggestAlternativeTable('default-restaurant-id', reservation, preferredTableId, date);
   }
 
-  // Optimizar distribución completa del día
-  async optimizeFullDayDistribution(date: string): Promise<TableAssignment[]> {
-    const allReservations = reservationService.getReservationsByDate(date)
-      .filter(r => r.status !== 'cancelled');
-    
-    // Remover asignaciones existentes temporalmente
-    const unassignedReservations = allReservations.map(r => ({ ...r, assignedTable: undefined }));
-    
-    return this.autoAssignTables(unassignedReservations, date);
+  async optimizeFullDayDistributionDefault(date: string): Promise<TableAssignment[]> {
+    return this.optimizeFullDayDistribution('default-restaurant-id', date);
   }
 
-  // Verificar conflictos de asignación
-  validateAssignment(
+  async validateAssignmentDefault(
     reservation: Reservation,
     tableId: string,
     date: string
-  ): { valid: boolean; conflicts: string[]; warnings: string[] } {
-    const table = this.tableLayout.tables.find(t => t.id === tableId);
-    const conflicts: string[] = [];
-    const warnings: string[] = [];
+  ): Promise<{ valid: boolean; conflicts: string[]; warnings: string[] }> {
+    return this.validateAssignment('default-restaurant-id', reservation, tableId, date);
+  }
 
-    if (!table) {
-      conflicts.push('Mesa no encontrada');
-      return { valid: false, conflicts, warnings };
-    }
-
-    // Verificar capacidad
-    if (table.capacity < reservation.guests) {
-      conflicts.push(`La mesa tiene capacidad para ${table.capacity} pero la reserva es para ${reservation.guests} personas`);
-    } else if (table.capacity > reservation.guests * 2) {
-      warnings.push('La mesa es considerablemente más grande que el grupo');
-    }
-
-    // Verificar disponibilidad de tiempo
-    const existingReservations = reservationService.getReservationsByDate(date);
-    const timeConflicts = this.getConflictingReservations(tableId, reservation, existingReservations, []);
-    
-    if (timeConflicts.length > 0) {
-      conflicts.push(`Conflicto de horario con reserva existente`);
-    }
-
-    return {
-      valid: conflicts.length === 0,
-      conflicts,
-      warnings
-    };
+  async getTablesStatusDefault(date: string, time?: string): Promise<TableWithReservation[]> {
+    return this.getTablesStatus('default-restaurant-id', date, time);
   }
 }
 
