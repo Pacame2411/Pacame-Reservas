@@ -3,8 +3,8 @@ import { format, parseISO, addMinutes, isAfter, isBefore, startOfDay, endOfDay }
 import { emailService } from './emailService';
 import { supabase } from '../utils/supabase';
 
-// Configuración del restaurante
-const restaurantConfig: RestaurantConfig = {
+// Configuración temporal del restaurante (se cargará desde Supabase más adelante)
+const DEFAULT_CONFIG = {
   name: "Bella Vista Restaurant",
   maxTotalCapacity: 120,
   maxGuestsPerReservation: 12,
@@ -23,23 +23,20 @@ const restaurantConfig: RestaurantConfig = {
   ]
 };
 
-// ID del restaurante por defecto (en producción esto vendría del usuario autenticado)
-const DEFAULT_RESTAURANT_ID = 'default-restaurant-id';
-
 class ReservationService {
-  // Obtener todas las reservas
-  async getAllReservations(): Promise<Reservation[]> {
+  // Obtener todas las reservas de un restaurante
+  async getAllReservations(restaurantId: string): Promise<Reservation[]> {
     try {
       const { data, error } = await supabase
         .from('reservations')
         .select('*')
-        .eq('restaurant_id', DEFAULT_RESTAURANT_ID)
+        .eq('restaurant_id', restaurantId)
         .order('reservation_date', { ascending: true })
         .order('reservation_time', { ascending: true });
 
       if (error) {
         console.error('Error obteniendo reservas:', error);
-        return [];
+        throw new Error(`Error al obtener reservas: ${error.message}`);
       }
 
       return this.mapSupabaseToReservation(data || []);
@@ -49,12 +46,15 @@ class ReservationService {
     }
   }
 
-  // Guardar reserva
-  async saveReservation(reservation: Omit<Reservation, 'id' | 'createdAt'>): Promise<Reservation> {
+  // Guardar nueva reserva
+  async saveReservation(
+    restaurantId: string, 
+    reservation: Omit<Reservation, 'id' | 'createdAt'>
+  ): Promise<Reservation> {
     try {
       // Mapear los datos al formato de Supabase
       const supabaseReservation = {
-        restaurant_id: DEFAULT_RESTAURANT_ID,
+        restaurant_id: restaurantId,
         customer_name: reservation.customerName,
         customer_email: reservation.email,
         customer_phone: reservation.phone,
@@ -157,19 +157,19 @@ class ReservationService {
     }
   }
 
-  // Obtener reservas por fecha
-  async getReservationsByDate(date: string): Promise<Reservation[]> {
+  // Obtener reservas por fecha y restaurante
+  async getReservationsByDate(restaurantId: string, date: string): Promise<Reservation[]> {
     try {
       const { data, error } = await supabase
         .from('reservations')
         .select('*')
-        .eq('restaurant_id', DEFAULT_RESTAURANT_ID)
+        .eq('restaurant_id', restaurantId)
         .eq('reservation_date', date)
         .order('reservation_time', { ascending: true });
 
       if (error) {
         console.error('Error obteniendo reservas por fecha:', error);
-        return [];
+        throw new Error(`Error al obtener reservas por fecha: ${error.message}`);
       }
 
       return this.mapSupabaseToReservation(data || []);
@@ -199,14 +199,17 @@ class ReservationService {
     }
   }
 
-  // Generar horarios disponibles para una fecha
-  async getAvailableTimeSlots(date: string): Promise<TimeSlot[]> {
+  // Generar horarios disponibles para una fecha y restaurante
+  async getAvailableTimeSlots(restaurantId: string, date: string): Promise<TimeSlot[]> {
     try {
-      const reservations = await this.getReservationsByDate(date);
+      const reservations = await this.getReservationsByDate(restaurantId, date);
       const slots: TimeSlot[] = [];
       
-      const startTime = restaurantConfig.operatingHours[0].start;
-      const endTime = restaurantConfig.operatingHours[0].end;
+      // Obtener configuración del restaurante (por ahora usamos la configuración por defecto)
+      const config = await this.getRestaurantConfig(restaurantId);
+      
+      const startTime = config.operatingHours[0].start;
+      const endTime = config.operatingHours[0].end;
       
       let currentTime = new Date(`${date}T${startTime}:00`);
       const endDateTime = new Date(`${date}T${endTime}:00`);
@@ -218,12 +221,12 @@ class ReservationService {
         
         slots.push({
           time: timeString,
-          available: totalGuests < restaurantConfig.maxCapacityPerSlot,
-          maxCapacity: restaurantConfig.maxCapacityPerSlot,
+          available: totalGuests < config.maxCapacityPerSlot,
+          maxCapacity: config.maxCapacityPerSlot,
           currentReservations: totalGuests
         });
         
-        currentTime = addMinutes(currentTime, restaurantConfig.timeSlotDuration);
+        currentTime = addMinutes(currentTime, config.timeSlotDuration);
       }
       
       return slots;
@@ -233,24 +236,27 @@ class ReservationService {
     }
   }
 
-  // Validar disponibilidad
-  async checkAvailability(date: string, time: string, guests: number): Promise<boolean> {
+  // Validar disponibilidad para un restaurante específico
+  async checkAvailability(restaurantId: string, date: string, time: string, guests: number): Promise<boolean> {
     try {
-      const reservations = await this.getReservationsByDate(date);
+      const reservations = await this.getReservationsByDate(restaurantId, date);
       const reservationsAtTime = reservations.filter(r => r.time === time && r.status !== 'cancelled');
       const totalGuests = reservationsAtTime.reduce((sum, r) => sum + r.guests, 0);
       
-      return (totalGuests + guests) <= restaurantConfig.maxCapacityPerSlot;
+      // Obtener configuración del restaurante
+      const config = await this.getRestaurantConfig(restaurantId);
+      
+      return (totalGuests + guests) <= config.maxCapacityPerSlot;
     } catch (error) {
       console.error('Error en checkAvailability:', error);
       return false;
     }
   }
 
-  // Obtener reservas del día actual
-  async getTodayReservations(): Promise<Reservation[]> {
+  // Obtener reservas del día actual para un restaurante
+  async getTodayReservations(restaurantId: string): Promise<Reservation[]> {
     const today = format(new Date(), 'yyyy-MM-dd');
-    return this.getReservationsByDate(today);
+    return this.getReservationsByDate(restaurantId, today);
   }
 
   // Actualizar estado de reserva
@@ -297,20 +303,18 @@ class ReservationService {
     }
   }
 
-  // Buscar reservas
-  async searchReservations(query: string): Promise<Reservation[]> {
+  // Buscar reservas en un restaurante específico
+  async searchReservations(restaurantId: string, query: string): Promise<Reservation[]> {
     try {
-      const lowerQuery = query.toLowerCase();
-      
       const { data, error } = await supabase
         .from('reservations')
         .select('*')
-        .eq('restaurant_id', DEFAULT_RESTAURANT_ID)
+        .eq('restaurant_id', restaurantId)
         .or(`customer_name.ilike.%${query}%,customer_email.ilike.%${query}%,customer_phone.like.%${query}%,id.ilike.%${query}%`);
 
       if (error) {
         console.error('Error buscando reservas:', error);
-        return [];
+        throw new Error(`Error al buscar reservas: ${error.message}`);
       }
 
       return this.mapSupabaseToReservation(data || []);
@@ -320,26 +324,19 @@ class ReservationService {
     }
   }
 
-  // Obtener estadísticas de reservas
-  async getReservationStats(startDate: string, endDate: string) {
+  // Obtener estadísticas de reservas para un restaurante
+  async getReservationStats(restaurantId: string, startDate: string, endDate: string) {
     try {
       const { data, error } = await supabase
         .from('reservations')
         .select('*')
-        .eq('restaurant_id', DEFAULT_RESTAURANT_ID)
+        .eq('restaurant_id', restaurantId)
         .gte('reservation_date', startDate)
         .lte('reservation_date', endDate);
 
       if (error) {
         console.error('Error obteniendo estadísticas:', error);
-        return {
-          total: 0,
-          confirmed: 0,
-          pending: 0,
-          cancelled: 0,
-          totalGuests: 0,
-          averagePartySize: 0
-        };
+        throw new Error(`Error al obtener estadísticas: ${error.message}`);
       }
 
       const reservations = data || [];
@@ -366,6 +363,66 @@ class ReservationService {
     }
   }
 
+  // Validar conflictos de horario para un restaurante
+  async checkTimeConflicts(
+    restaurantId: string, 
+    date: string, 
+    time: string, 
+    duration: number, 
+    excludeId?: string
+  ): Promise<boolean> {
+    try {
+      const reservations = await this.getReservationsByDate(restaurantId, date);
+      const startTime = new Date(`${date}T${time}:00`);
+      const endTime = addMinutes(startTime, duration);
+      
+      return reservations.some(reservation => {
+        if (excludeId && reservation.id === excludeId) return false;
+        if (reservation.status === 'cancelled') return false;
+        
+        const resStartTime = new Date(`${reservation.date}T${reservation.time}:00`);
+        const resEndTime = addMinutes(resStartTime, reservation.duration || 120);
+        
+        // Verificar solapamiento
+        return (startTime < resEndTime && endTime > resStartTime);
+      });
+    } catch (error) {
+      console.error('Error en checkTimeConflicts:', error);
+      return false;
+    }
+  }
+
+  // Inicializar verificación de recordatorios pendientes para un restaurante
+  async initializeReminderCheck(restaurantId: string): Promise<void> {
+    try {
+      await emailService.checkAndSendPendingReminders();
+      
+      // Configurar verificación periódica cada hora
+      setInterval(async () => {
+        await emailService.checkAndSendPendingReminders();
+      }, 60 * 60 * 1000); // 1 hora
+      
+      console.log(`✅ Sistema de recordatorios inicializado para restaurante ${restaurantId}`);
+    } catch (error) {
+      console.error('Error inicializando sistema de recordatorios:', error);
+    }
+  }
+
+  // Obtener configuración del restaurante (temporal - se cargará desde Supabase más adelante)
+  async getRestaurantConfig(restaurantId: string): Promise<RestaurantConfig> {
+    try {
+      // TODO: Cargar configuración real desde la tabla restaurant_configurations
+      // Por ahora, devolvemos la configuración por defecto
+      return {
+        ...DEFAULT_CONFIG,
+        name: `Restaurant ${restaurantId}` // Personalizar según el restaurante
+      };
+    } catch (error) {
+      console.error('Error obteniendo configuración del restaurante:', error);
+      return DEFAULT_CONFIG;
+    }
+  }
+
   // Mapear datos de Supabase al formato de la aplicación
   private mapSupabaseToReservation(supabaseData: any[]): Reservation[] {
     return supabaseData.map(item => ({
@@ -389,11 +446,13 @@ class ReservationService {
   // Enviar email de confirmación
   private async sendConfirmationEmail(reservation: Reservation): Promise<void> {
     try {
+      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+      
       const emailData = {
         to: reservation.email,
         customerName: reservation.customerName,
         reservationId: reservation.id,
-        restaurantName: restaurantConfig.name,
+        restaurantName: config.name,
         date: reservation.date,
         time: reservation.time,
         guests: reservation.guests,
@@ -423,7 +482,7 @@ class ReservationService {
         to: reservation.email,
         customerName: reservation.customerName,
         reservationId: reservation.id,
-        restaurantName: restaurantConfig.name,
+        restaurantName: DEFAULT_CONFIG.name, // TODO: usar configuración real
         date: reservation.date,
         time: reservation.time,
         guests: reservation.guests,
@@ -442,11 +501,13 @@ class ReservationService {
   // Enviar email de modificación
   private async sendModificationEmail(reservation: Reservation): Promise<void> {
     try {
+      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+      
       const emailData = {
         to: reservation.email,
         customerName: reservation.customerName,
         reservationId: reservation.id,
-        restaurantName: restaurantConfig.name,
+        restaurantName: config.name,
         date: reservation.date,
         time: reservation.time,
         guests: reservation.guests,
@@ -480,11 +541,13 @@ class ReservationService {
         await this.sendConfirmationEmail(reservation);
       } else if (newStatus === 'cancelled') {
         // Reserva cancelada - enviar cancelación
+        const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+        
         const emailData = {
           to: reservation.email,
           customerName: reservation.customerName,
           reservationId: reservation.id,
-          restaurantName: restaurantConfig.name,
+          restaurantName: config.name,
           date: reservation.date,
           time: reservation.time,
           guests: reservation.guests,
@@ -512,50 +575,6 @@ class ReservationService {
       oldReservation.guests !== newReservation.guests ||
       oldReservation.assignedTable !== newReservation.assignedTable
     );
-  }
-
-  // Inicializar verificación de recordatorios pendientes
-  async initializeReminderCheck(): Promise<void> {
-    try {
-      await emailService.checkAndSendPendingReminders();
-      
-      // Configurar verificación periódica cada hora
-      setInterval(async () => {
-        await emailService.checkAndSendPendingReminders();
-      }, 60 * 60 * 1000); // 1 hora
-      
-      console.log('✅ Sistema de recordatorios inicializado');
-    } catch (error) {
-      console.error('Error inicializando sistema de recordatorios:', error);
-    }
-  }
-
-  // Obtener configuración del restaurante
-  getRestaurantConfig(): RestaurantConfig {
-    return restaurantConfig;
-  }
-
-  // Validar conflictos de horario
-  async checkTimeConflicts(date: string, time: string, duration: number, excludeId?: string): Promise<boolean> {
-    try {
-      const reservations = await this.getReservationsByDate(date);
-      const startTime = new Date(`${date}T${time}:00`);
-      const endTime = addMinutes(startTime, duration);
-      
-      return reservations.some(reservation => {
-        if (excludeId && reservation.id === excludeId) return false;
-        if (reservation.status === 'cancelled') return false;
-        
-        const resStartTime = new Date(`${reservation.date}T${reservation.time}:00`);
-        const resEndTime = addMinutes(resStartTime, reservation.duration || 120);
-        
-        // Verificar solapamiento
-        return (startTime < resEndTime && endTime > resStartTime);
-      });
-    } catch (error) {
-      console.error('Error en checkTimeConflicts:', error);
-      return false;
-    }
   }
 
   // Obtener historial de emails para una reserva
@@ -600,12 +619,13 @@ class ReservationService {
       }
 
       const reservation = this.mapSupabaseToReservation([data])[0];
+      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
 
       const emailData = {
         to: reservation.email,
         customerName: reservation.customerName,
         reservationId: reservation.id,
-        restaurantName: restaurantConfig.name,
+        restaurantName: config.name,
         date: reservation.date,
         time: reservation.time,
         guests: reservation.guests,
@@ -622,11 +642,57 @@ class ReservationService {
     }
   }
 
-  // Obtener ID del restaurante (para uso futuro con autenticación)
-  private async getRestaurantId(): Promise<string> {
-    // En el futuro, esto obtendrá el restaurant_id del usuario autenticado
-    // Por ahora, usamos un ID por defecto
-    return DEFAULT_RESTAURANT_ID;
+  // Métodos de conveniencia para mantener compatibilidad con código existente
+  // Estos métodos usan un restaurant_id por defecto
+
+  // Obtener todas las reservas (usando restaurant_id por defecto)
+  async getAllReservationsDefault(): Promise<Reservation[]> {
+    return this.getAllReservations('default-restaurant-id');
+  }
+
+  // Guardar reserva (usando restaurant_id por defecto)
+  async saveReservationDefault(reservation: Omit<Reservation, 'id' | 'createdAt'>): Promise<Reservation> {
+    return this.saveReservation('default-restaurant-id', reservation);
+  }
+
+  // Obtener reservas por fecha (usando restaurant_id por defecto)
+  async getReservationsByDateDefault(date: string): Promise<Reservation[]> {
+    return this.getReservationsByDate('default-restaurant-id', date);
+  }
+
+  // Verificar disponibilidad (usando restaurant_id por defecto)
+  async checkAvailabilityDefault(date: string, time: string, guests: number): Promise<boolean> {
+    return this.checkAvailability('default-restaurant-id', date, time, guests);
+  }
+
+  // Obtener horarios disponibles (usando restaurant_id por defecto)
+  async getAvailableTimeSlotsDefault(date: string): Promise<TimeSlot[]> {
+    return this.getAvailableTimeSlots('default-restaurant-id', date);
+  }
+
+  // Obtener reservas de hoy (usando restaurant_id por defecto)
+  async getTodayReservationsDefault(): Promise<Reservation[]> {
+    return this.getTodayReservations('default-restaurant-id');
+  }
+
+  // Buscar reservas (usando restaurant_id por defecto)
+  async searchReservationsDefault(query: string): Promise<Reservation[]> {
+    return this.searchReservations('default-restaurant-id', query);
+  }
+
+  // Obtener estadísticas (usando restaurant_id por defecto)
+  async getReservationStatsDefault(startDate: string, endDate: string) {
+    return this.getReservationStats('default-restaurant-id', startDate, endDate);
+  }
+
+  // Verificar conflictos de tiempo (usando restaurant_id por defecto)
+  async checkTimeConflictsDefault(date: string, time: string, duration: number, excludeId?: string): Promise<boolean> {
+    return this.checkTimeConflicts('default-restaurant-id', date, time, duration, excludeId);
+  }
+
+  // Inicializar recordatorios (usando restaurant_id por defecto)
+  async initializeReminderCheckDefault(): Promise<void> {
+    return this.initializeReminderCheck('default-restaurant-id');
   }
 }
 
