@@ -3,7 +3,7 @@ import { format, parseISO, addMinutes, isAfter, isBefore, startOfDay, endOfDay }
 import { emailService } from './emailService';
 import { supabase } from '../utils/supabase';
 
-// Configuración temporal del restaurante (se cargará desde Supabase más adelante)
+// Configuración temporal del restaurante (se cargará desde configurationService más adelante)
 const DEFAULT_CONFIG = {
   name: "Bella Vista Restaurant",
   maxTotalCapacity: 120,
@@ -48,25 +48,25 @@ class ReservationService {
 
   // Guardar nueva reserva
   async saveReservation(
-    restaurantId: string, 
-    reservation: Omit<Reservation, 'id' | 'createdAt'>
+    reservation: Omit<Reservation, 'id' | 'created_at' | 'updated_at'>
   ): Promise<Reservation> {
     try {
-      // Mapear los datos al formato de Supabase
+      // El objeto reservation ya debe tener restaurant_id incluido
+      // Mapear los datos al formato snake_case de Supabase
       const supabaseReservation = {
-        restaurant_id: restaurantId,
-        customer_name: reservation.customerName,
-        customer_email: reservation.email,
-        customer_phone: reservation.phone,
-        reservation_date: reservation.date,
-        reservation_time: reservation.time,
+        restaurant_id: reservation.restaurant_id,
+        customer_name: reservation.customer_name,
+        customer_email: reservation.customer_email,
+        customer_phone: reservation.customer_phone,
+        reservation_date: reservation.reservation_date,
+        reservation_time: reservation.reservation_time,
         guests: reservation.guests,
-        status: reservation.status || 'confirmed',
-        special_requests: reservation.specialRequests || null,
-        table_id: reservation.assignedTable || null,
-        duration: reservation.duration || 120,
-        source: reservation.createdBy === 'manager' ? 'manual' : 'online',
-        created_by: null // Se puede vincular al usuario autenticado en el futuro
+        status: reservation.status || 'pending',
+        special_requests: reservation.special_requests || null,
+        table_type_preference: reservation.table_type_preference || null,
+        duration_minutes: reservation.duration_minutes || 120,
+        assigned_table_id: reservation.assigned_table_id || null,
+        created_by: reservation.created_by || 'customer'
       };
 
       const { data, error } = await supabase
@@ -112,19 +112,21 @@ class ReservationService {
 
       const oldReservation = this.mapSupabaseToReservation([currentData])[0];
 
-      // Mapear las actualizaciones al formato de Supabase
+      // Mapear las actualizaciones al formato snake_case de Supabase
       const supabaseUpdates: any = {};
       
-      if (updates.customerName !== undefined) supabaseUpdates.customer_name = updates.customerName;
-      if (updates.email !== undefined) supabaseUpdates.customer_email = updates.email;
-      if (updates.phone !== undefined) supabaseUpdates.customer_phone = updates.phone;
-      if (updates.date !== undefined) supabaseUpdates.reservation_date = updates.date;
-      if (updates.time !== undefined) supabaseUpdates.reservation_time = updates.time;
+      if (updates.customer_name !== undefined) supabaseUpdates.customer_name = updates.customer_name;
+      if (updates.customer_email !== undefined) supabaseUpdates.customer_email = updates.customer_email;
+      if (updates.customer_phone !== undefined) supabaseUpdates.customer_phone = updates.customer_phone;
+      if (updates.reservation_date !== undefined) supabaseUpdates.reservation_date = updates.reservation_date;
+      if (updates.reservation_time !== undefined) supabaseUpdates.reservation_time = updates.reservation_time;
       if (updates.guests !== undefined) supabaseUpdates.guests = updates.guests;
       if (updates.status !== undefined) supabaseUpdates.status = updates.status;
-      if (updates.specialRequests !== undefined) supabaseUpdates.special_requests = updates.specialRequests;
-      if (updates.assignedTable !== undefined) supabaseUpdates.table_id = updates.assignedTable;
-      if (updates.duration !== undefined) supabaseUpdates.duration = updates.duration;
+      if (updates.special_requests !== undefined) supabaseUpdates.special_requests = updates.special_requests;
+      if (updates.table_type_preference !== undefined) supabaseUpdates.table_type_preference = updates.table_type_preference;
+      if (updates.duration_minutes !== undefined) supabaseUpdates.duration_minutes = updates.duration_minutes;
+      if (updates.assigned_table_id !== undefined) supabaseUpdates.assigned_table_id = updates.assigned_table_id;
+      if (updates.created_by !== undefined) supabaseUpdates.created_by = updates.created_by;
 
       // Agregar timestamp de actualización
       supabaseUpdates.updated_at = new Date().toISOString();
@@ -216,7 +218,9 @@ class ReservationService {
       
       while (isBefore(currentTime, endDateTime)) {
         const timeString = format(currentTime, 'HH:mm');
-        const reservationsAtTime = reservations.filter(r => r.time === timeString && r.status !== 'cancelled');
+        const reservationsAtTime = reservations.filter(r => 
+          r.reservation_time === timeString && r.status !== 'cancelled'
+        );
         const totalGuests = reservationsAtTime.reduce((sum, r) => sum + r.guests, 0);
         
         slots.push({
@@ -240,7 +244,9 @@ class ReservationService {
   async checkAvailability(restaurantId: string, date: string, time: string, guests: number): Promise<boolean> {
     try {
       const reservations = await this.getReservationsByDate(restaurantId, date);
-      const reservationsAtTime = reservations.filter(r => r.time === time && r.status !== 'cancelled');
+      const reservationsAtTime = reservations.filter(r => 
+        r.reservation_time === time && r.status !== 'cancelled'
+      );
       const totalGuests = reservationsAtTime.reduce((sum, r) => sum + r.guests, 0);
       
       // Obtener configuración del restaurante
@@ -380,8 +386,8 @@ class ReservationService {
         if (excludeId && reservation.id === excludeId) return false;
         if (reservation.status === 'cancelled') return false;
         
-        const resStartTime = new Date(`${reservation.date}T${reservation.time}:00`);
-        const resEndTime = addMinutes(resStartTime, reservation.duration || 120);
+        const resStartTime = new Date(`${reservation.reservation_date}T${reservation.reservation_time}:00`);
+        const resEndTime = addMinutes(resStartTime, reservation.duration_minutes || 120);
         
         // Verificar solapamiento
         return (startTime < resEndTime && endTime > resStartTime);
@@ -408,7 +414,7 @@ class ReservationService {
     }
   }
 
-  // Obtener configuración del restaurante (temporal - se cargará desde Supabase más adelante)
+  // Obtener configuración del restaurante (temporal - se cargará desde configurationService más adelante)
   async getRestaurantConfig(restaurantId: string): Promise<RestaurantConfig> {
     try {
       // TODO: Cargar configuración real desde la tabla restaurant_configurations
@@ -423,42 +429,50 @@ class ReservationService {
     }
   }
 
-  // Mapear datos de Supabase al formato de la aplicación
+  // Mapear datos de Supabase (snake_case) al formato de la aplicación
   private mapSupabaseToReservation(supabaseData: any[]): Reservation[] {
     return supabaseData.map(item => ({
       id: item.id,
-      customerName: item.customer_name,
-      email: item.customer_email,
-      phone: item.customer_phone,
-      date: item.reservation_date,
-      time: item.reservation_time,
+      restaurant_id: item.restaurant_id,
+      customer_name: item.customer_name,
+      customer_email: item.customer_email,
+      customer_phone: item.customer_phone,
+      reservation_date: item.reservation_date,
+      reservation_time: item.reservation_time,
       guests: item.guests,
       status: item.status,
-      createdAt: item.created_at,
-      specialRequests: item.special_requests,
-      tableType: item.table_type,
-      duration: item.duration,
-      assignedTable: item.table_id,
-      createdBy: item.source === 'manual' ? 'manager' : 'customer'
+      special_requests: item.special_requests,
+      table_type_preference: item.table_type_preference,
+      duration_minutes: item.duration_minutes,
+      assigned_table_id: item.assigned_table_id,
+      created_by: item.created_by,
+      created_at: item.created_at,
+      updated_at: item.updated_at,
+      confirmed_at: item.confirmed_at,
+      cancelled_at: item.cancelled_at,
+      cancellation_reason: item.cancellation_reason,
+      reminder_sent: item.reminder_sent,
+      notes: item.notes,
+      source: item.source
     }));
   }
 
   // Enviar email de confirmación
   private async sendConfirmationEmail(reservation: Reservation): Promise<void> {
     try {
-      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+      const config = await this.getRestaurantConfig(reservation.restaurant_id);
       
       const emailData = {
-        to: reservation.email,
-        customerName: reservation.customerName,
+        to: reservation.customer_email,
+        customerName: reservation.customer_name,
         reservationId: reservation.id,
         restaurantName: config.name,
-        date: reservation.date,
-        time: reservation.time,
+        date: reservation.reservation_date,
+        time: reservation.reservation_time,
         guests: reservation.guests,
-        phone: reservation.phone,
-        specialRequests: reservation.specialRequests,
-        assignedTable: reservation.assignedTable,
+        phone: reservation.customer_phone,
+        specialRequests: reservation.special_requests,
+        assignedTable: reservation.assigned_table_id,
         confirmationUrl: `${window.location.origin}/reservation/${reservation.id}`,
         cancellationUrl: `${window.location.origin}/cancel/${reservation.id}`
       };
@@ -466,7 +480,7 @@ class ReservationService {
       const result = await emailService.sendConfirmationEmail(emailData);
       
       if (result.success) {
-        console.log(`✅ Email de confirmación enviado exitosamente a ${reservation.email}`);
+        console.log(`✅ Email de confirmación enviado exitosamente a ${reservation.customer_email}`);
       } else {
         console.error(`❌ Error enviando email de confirmación: ${result.error}`);
       }
@@ -479,20 +493,20 @@ class ReservationService {
   private scheduleReminderEmail(reservation: Reservation): void {
     try {
       const emailData = {
-        to: reservation.email,
-        customerName: reservation.customerName,
+        to: reservation.customer_email,
+        customerName: reservation.customer_name,
         reservationId: reservation.id,
         restaurantName: DEFAULT_CONFIG.name, // TODO: usar configuración real
-        date: reservation.date,
-        time: reservation.time,
+        date: reservation.reservation_date,
+        time: reservation.reservation_time,
         guests: reservation.guests,
-        phone: reservation.phone,
-        specialRequests: reservation.specialRequests,
-        assignedTable: reservation.assignedTable
+        phone: reservation.customer_phone,
+        specialRequests: reservation.special_requests,
+        assignedTable: reservation.assigned_table_id
       };
 
       emailService.scheduleReminderEmail(emailData);
-      console.log(`📅 Recordatorio programado para ${reservation.customerName} - ${reservation.date}`);
+      console.log(`📅 Recordatorio programado para ${reservation.customer_name} - ${reservation.reservation_date}`);
     } catch (error) {
       console.error('Error programando recordatorio:', error);
     }
@@ -501,25 +515,25 @@ class ReservationService {
   // Enviar email de modificación
   private async sendModificationEmail(reservation: Reservation): Promise<void> {
     try {
-      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+      const config = await this.getRestaurantConfig(reservation.restaurant_id);
       
       const emailData = {
-        to: reservation.email,
-        customerName: reservation.customerName,
+        to: reservation.customer_email,
+        customerName: reservation.customer_name,
         reservationId: reservation.id,
         restaurantName: config.name,
-        date: reservation.date,
-        time: reservation.time,
+        date: reservation.reservation_date,
+        time: reservation.reservation_time,
         guests: reservation.guests,
-        phone: reservation.phone,
-        specialRequests: reservation.specialRequests,
-        assignedTable: reservation.assignedTable
+        phone: reservation.customer_phone,
+        specialRequests: reservation.special_requests,
+        assignedTable: reservation.assigned_table_id
       };
 
       const result = await emailService.sendModificationEmail(emailData);
       
       if (result.success) {
-        console.log(`✅ Email de modificación enviado exitosamente a ${reservation.email}`);
+        console.log(`✅ Email de modificación enviado exitosamente a ${reservation.customer_email}`);
       } else {
         console.error(`❌ Error enviando email de modificación: ${result.error}`);
       }
@@ -541,23 +555,23 @@ class ReservationService {
         await this.sendConfirmationEmail(reservation);
       } else if (newStatus === 'cancelled') {
         // Reserva cancelada - enviar cancelación
-        const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+        const config = await this.getRestaurantConfig(reservation.restaurant_id);
         
         const emailData = {
-          to: reservation.email,
-          customerName: reservation.customerName,
+          to: reservation.customer_email,
+          customerName: reservation.customer_name,
           reservationId: reservation.id,
           restaurantName: config.name,
-          date: reservation.date,
-          time: reservation.time,
+          date: reservation.reservation_date,
+          time: reservation.reservation_time,
           guests: reservation.guests,
-          phone: reservation.phone
+          phone: reservation.customer_phone
         };
 
         const result = await emailService.sendCancellationEmail(emailData);
         
         if (result.success) {
-          console.log(`✅ Email de cancelación enviado exitosamente a ${reservation.email}`);
+          console.log(`✅ Email de cancelación enviado exitosamente a ${reservation.customer_email}`);
         } else {
           console.error(`❌ Error enviando email de cancelación: ${result.error}`);
         }
@@ -570,10 +584,10 @@ class ReservationService {
   // Verificar si hay cambios significativos
   private hasSignificantChanges(oldReservation: Reservation, newReservation: Reservation): boolean {
     return (
-      oldReservation.date !== newReservation.date ||
-      oldReservation.time !== newReservation.time ||
+      oldReservation.reservation_date !== newReservation.reservation_date ||
+      oldReservation.reservation_time !== newReservation.reservation_time ||
       oldReservation.guests !== newReservation.guests ||
-      oldReservation.assignedTable !== newReservation.assignedTable
+      oldReservation.assigned_table_id !== newReservation.assigned_table_id
     );
   }
 
@@ -619,19 +633,19 @@ class ReservationService {
       }
 
       const reservation = this.mapSupabaseToReservation([data])[0];
-      const config = await this.getRestaurantConfig('default'); // TODO: usar restaurant_id real
+      const config = await this.getRestaurantConfig(reservation.restaurant_id);
 
       const emailData = {
-        to: reservation.email,
-        customerName: reservation.customerName,
+        to: reservation.customer_email,
+        customerName: reservation.customer_name,
         reservationId: reservation.id,
         restaurantName: config.name,
-        date: reservation.date,
-        time: reservation.time,
+        date: reservation.reservation_date,
+        time: reservation.reservation_time,
         guests: reservation.guests,
-        phone: reservation.phone,
-        specialRequests: reservation.specialRequests,
-        assignedTable: reservation.assignedTable
+        phone: reservation.customer_phone,
+        specialRequests: reservation.special_requests,
+        assignedTable: reservation.assigned_table_id
       };
 
       const result = await emailService.sendReminderEmail(emailData);
@@ -651,8 +665,13 @@ class ReservationService {
   }
 
   // Guardar reserva (usando restaurant_id por defecto)
-  async saveReservationDefault(reservation: Omit<Reservation, 'id' | 'createdAt'>): Promise<Reservation> {
-    return this.saveReservation('default-restaurant-id', reservation);
+  async saveReservationDefault(reservation: Omit<Reservation, 'id' | 'created_at'>): Promise<Reservation> {
+    // Agregar restaurant_id por defecto si no está presente
+    const reservationWithRestaurant = {
+      ...reservation,
+      restaurant_id: reservation.restaurant_id || 'default-restaurant-id'
+    };
+    return this.saveReservation(reservationWithRestaurant);
   }
 
   // Obtener reservas por fecha (usando restaurant_id por defecto)

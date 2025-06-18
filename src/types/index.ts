@@ -1,18 +1,26 @@
 export interface Reservation {
   id: string;
-  customerName: string;
-  email: string;
-  phone: string;
-  date: string;
-  time: string;
+  restaurant_id: string;
+  customer_name: string;
+  customer_email: string;
+  customer_phone: string;
+  reservation_date: string;
+  reservation_time: string;
   guests: number;
-  status: 'confirmed' | 'pending' | 'cancelled';
-  createdAt: string;
-  specialRequests?: string;
-  tableType?: string;
-  duration?: number;
-  assignedTable?: string;
-  createdBy?: 'customer' | 'manager';
+  status: 'confirmed' | 'pending' | 'cancelled' | 'occupied' | 'blocked';
+  special_requests?: string;
+  table_type_preference?: string;
+  duration_minutes?: number;
+  assigned_table_id?: string;
+  created_by: 'customer' | 'manager';
+  created_at: string;
+  updated_at?: string;
+  confirmed_at?: string;
+  cancelled_at?: string;
+  cancellation_reason?: string;
+  reminder_sent?: boolean;
+  notes?: string;
+  source?: string;
 }
 
 export interface TimeSlot {
